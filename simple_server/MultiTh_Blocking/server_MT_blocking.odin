@@ -7,39 +7,43 @@ import "core:fmt"
 import "core:net"
 import posix "core:sys/posix"
 import os "core:os"
+import mem "core:mem"
 
 // const
 BUF_SIZE        :: 4096
 MAX_CONNECTIONS :: 10
+sep := []u8{13,10,13,10} // "\r\n\r\n"
+buf: [BUF_SIZE]byte
+
 
 format_response :: proc(
     status_code: u16,
     status: string,
     content_type: string,
     body : string = "") -> []u8 {
-
-    header := fmt.tprintf(
-        "HTTP/1.1 %d %s\r\n" +
-        "Content-Type: %s\r\n" +
-        "Content-Length: %d\r\n" +
-        "Connection: close\r\n" +
-        "\r\n",
-        status_code,
-        status,
-        content_type,
-        len(body)
-    )
-
-    resp := strings.concatenate({header, body}, context.allocator)
-    RESP_LEN := len(resp)
-    resp_bytes := make([dynamic]u8, context.temp_allocator);
-    for x in 0..<RESP_LEN {
-        append(&resp_bytes, resp[x])
+        
+        header := fmt.tprintf(
+            "HTTP/1.1 %d %s\r\n" +
+            "Content-Type: %s\r\n" +
+            "Content-Length: %d\r\n" +
+            "Connection: close\r\n" +
+            "\r\n",
+            status_code,
+            status,
+            content_type,
+            len(body)
+        )
+        
+        resp := strings.concatenate({header, body}, context.allocator)
+        RESP_LEN := len(resp)
+        resp_bytes := make([dynamic]u8, context.temp_allocator);
+        for x in 0..<RESP_LEN {
+            append(&resp_bytes, resp[x])
+        }
+        
+        return resp_bytes[:]
     }
-
-    return resp_bytes[:]
-}
-
+    
 // parse Content-Length
 parse_content_length :: proc(headers: []u8) -> int {
     lower := strings.to_lower(string(headers), context.temp_allocator)
@@ -71,77 +75,52 @@ Headers :: struct {
 
 parse_header_params :: proc(headers: []u8) -> (header_s: Headers, err: net.Resolve_Error) {
     lower := strings.to_lower(string(headers), context.temp_allocator)
-    keys := []string{
-        "host: ",
-        "user-agent: ",
-        "accept: ",
-        "content-length: ",
-        "content-type: "
+
+    keys :=[]string{
+        "host:",
+        "user-agent:",
+        "accept:",
+        "content-length:",
+        "content-type:",
     }
+    
+    header_s.method = lower[:strings.index_byte(lower, ' ')]
     for key in keys {
         k := strings.index(lower, key)
         if k < 0 { continue  }
         start := k + len(key)
         // for start < len(lower) && (lower[start] == ' ' || lower[start] == '\t') do start += 1
-        n := 0
-        have := false
-        for start < len(lower) && lower[start] >= '0' && lower[start] <= '9' {
-            n = n*10 + int(lower[start]-'0')
-            start += 1
-            have = true
+        if key == "content-length: " {
+            n := 0
+            have := false
+            for start < len(lower) && lower[start] >= '0' && lower[start] <= '9' {
+                n = n*10 + int(lower[start]-'0')
+                start += 1
+                have = true
+            }
+            if (!have) do n = 0
+            header_s.content_length = n
         }
-
+        else {
+            end := strings.index(lower[start:], "\r\n")
+            value, _ := strings.substring(lower, start, end)
+            switch key {
+                case "host": header_s.host = value; break;
+                case "accept": header_s.accept = value; break;
+                case "user-agent": header_s.user_agent = value; break;
+                case "content-type": header_s.constent_type = value; break;
+                case: ;
+            }
+        }
     }
-    key := "content-length:"
-    if !have { return -1 }
-    return n
+    return header_s, net.Resolve_Error.None
 }
 
-
-fill_headers :: proc (headers: []u8) {
-    s_headers := (string(headers))
-    head_arr := strings.split(s_headers, "\n")
-
-
-}
-
-handle_client :: proc(client: rawptr) {
-    // shadowing of the client arg with cast to the correct data type
-    client := net.TCP_Socket(uintptr(client))
-
-    // closing with defer
-    defer net.close(client)
-    defer free_all(context.temp_allocator)
-
-    buf: [BUF_SIZE]byte
-    msg := make([dynamic]byte, context.temp_allocator);
-    sep := []u8{13,10,13,10} // "\r\n\r\n"
-    end := -1
-    read := 0
-    for end < 0 {
-        n, err := net.recv_tcp(client, buf[:])
-        if err != nil {
-            fmt.println("[WARNING]Recv error:", err)
-            return
-        }
-        if n == 0 { return }
-        append_elems(&msg, ..buf[:n])
-        end = strings.index(string(msg[:]), string(sep[:]))
-        if len(buf) > 1 << 20 {
-            fmt.println("[ERROR]Headers too large")
-            return
-        }
-        read += n
-    }
-    // headers
-    headers := buf[:end]
-    header: Headers = fill_headers(headers)
+handle_post :: proc(end: int, read: int, headers: Headers, client: net.TCP_Socket, msg: ^[dynamic]byte) {
     body_start := end + len(sep)
 
-    fmt.printfln(string(headers))
-
     // cont_len
-    content_len := parse_content_length(headers)
+    content_len := headers.content_length
     if content_len < 0 { content_len = 0 }
     else {
         fmt.println("--- BODY START ---")
@@ -163,18 +142,122 @@ handle_client :: proc(client: rawptr) {
             return
         }
         if n == 0 { return }
-        append_elems(&msg, ..buf[:n])
+        append_elems(msg, ..buf[:n])
         fmt.println(string(buf[:n]))
         remaining -= n
     }
 
-    if (content_len > 0) { fmt.println("--- END BODY ---") }
+    if (content_len >= 0) { fmt.println("--- END BODY ---") }
 
     // send
-    _, send_err := net.send_tcp(client, format_response(200, "OK", "text/html", "Hello from Odin!"))
+    _, send_err := net.send_tcp(client, format_response(200, "OK", "", ""))
     if send_err != nil {
         fmt.println("send error:", send_err)
     }
+}
+
+handle_get :: proc(end: int, read: int, headers: Headers, client: net.TCP_Socket, msg: ^[dynamic]byte) {
+    _, send_err := net.send_tcp(client, format_response(200, "OK", "text/html", "Hello from Odin!"))
+}
+
+manage_request :: proc (end: int, read: int, headers: Headers, client: net.TCP_Socket, msg: ^[dynamic]byte) {
+    switch headers.method {
+        case "post": handle_post(
+            end,
+            read,
+            headers,
+            client,
+            msg
+        )
+        case "get": handle_get(
+            end,
+            read,
+            headers,
+            client,
+            msg
+        )
+    }
+}
+
+handle_client :: proc(client: rawptr) {
+    // shadowing of the client arg with cast to the correct data type
+    client := net.TCP_Socket(uintptr(client))
+
+    // closing with defer
+    defer net.close(client)
+    defer free_all(context.temp_allocator)
+
+    msg := make([dynamic]byte, context.temp_allocator);
+    end := -1
+    read := 0
+    for end < 0 {
+        n, err := net.recv_tcp(client, buf[:])
+        if err != nil {
+            fmt.println("[WARNING]Recv error:", err)
+            return
+        }
+        if n == 0 { return }
+        append_elems(&msg, ..buf[:n])
+        end = strings.index(string(msg[:]), string(sep[:]))
+        if len(buf) > 1 << 20 {
+            fmt.println("[ERROR]Headers too large")
+            return
+        }
+        read += n
+    }
+    // headers
+    // headers := buf[:end]
+    headers, _ := parse_header_params(buf[:end])
+    fmt.printfln(string(buf[:end]))
+
+    manage_request(
+        end,
+        read,
+        headers,
+        client,
+        &msg
+    )
+
+
+
+    // body_start := end + len(sep)
+
+
+    // // cont_len
+    // content_len := parse_content_length(headers)
+    // if content_len < 0 { content_len = 0 }
+    // else {
+    //     fmt.println("--- BODY START ---")
+    // }
+
+    // // check for bytes of the body attached to the \r\n\r\n
+    // body_part := read - body_start
+    // if body_part > 0 {
+    //     fmt.println(string(buf[body_start:]))
+    // }
+
+    // // go on reading
+    // remaining := content_len - body_part
+    // fmt.printfln("c l %d, b p %d", content_len, body_part)
+    // for remaining > 0 {
+    //     n, err := net.recv_tcp(client, buf[:])
+    //     if err != nil {
+    //         fmt.println("[WARNING]Recv error:", err)
+    //         return
+    //     }
+    //     if n == 0 { return }
+    //     append_elems(&msg, ..buf[:n])
+    //     fmt.println(string(buf[:n]))
+    //     remaining -= n
+    // }
+
+    // if (content_len > 0) { fmt.println("--- END BODY ---") }
+
+    // // send
+    // _, send_err := net.send_tcp(client, format_response(200, "OK", "text/html", "Hello from Odin!"))
+    // if send_err != nil {
+    //     fmt.println("send error:", send_err)
+    // }
     free_all(context.temp_allocator)
 }
 
@@ -195,6 +278,24 @@ handler_sigint :: proc "c" (posix.Signal) {
 }
 
 main :: proc() {
+    // tracking allocator
+    when ODIN_DEBUG {
+        track: mem.Tracking_Allocator
+        mem.tracking_allocator_init(&track, context.temp_allocator)
+        context.temp_allocator = mem.tracking_allocator(&track)
+
+        defer {
+			if len(track.allocation_map) > 0 {
+				fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+    }
+
+
     // set up for the socket
     listen_s, err_ls = net.listen_tcp(net.Endpoint {
         port    = 8000,
@@ -206,14 +307,6 @@ main :: proc() {
     defer net.close(listen_s)
 
     fmt.println("[DEBUG]Listening on 127.0.0.1:8000 for max", MAX_CONNECTIONS, "clients. Press CTRL+C to stop.")
-
-    // // signals setup for graceful shutdown with SIGINT
-    // handler_sigint :: proc "c" (posix.Signal) {
-    //     context = runtime.default_context()
-    //     fmt.println("\nSIGINT received.\nClosing...")
-    //     state = net.Link_States.Down
-    //     // if listen_s != 0 do net.close(listen_s)
-    // }
 
     posix.signal(posix.Signal(posix.SIGINT), handler_sigint)
 
